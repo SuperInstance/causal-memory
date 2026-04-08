@@ -1,6 +1,6 @@
 # causal-memory
 
-Causal reasoning engine — track and query cause-effect chains across fleet actions
+Causal reasoning engine
 
 Part of the [Cocapn fleet](https://github.com/Lucineer/the-fleet).
 

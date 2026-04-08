@@ -2,445 +2,505 @@ interface CausalEvent {
   id: string;
   timestamp: number;
   causeId?: string;
-  action: string;
-  agent: string;
-  effect: string;
+  effectIds: string[];
+  description: string;
+  tags: string[];
   confidence: number;
-  metadata?: Record<string, any>;
 }
 
 interface CausalQuery {
-  type: 'effects' | 'causes' | 'counterfactual' | 'chain';
-  targetId?: string;
-  startTime?: number;
-  endTime?: number;
-  agentFilter?: string[];
-  actionFilter?: string[];
-  intervention?: {
-    eventId: string;
-    alternativeAction: string;
-  };
+  type: 'counterfactual' | 'temporal' | 'chain';
+  eventId?: string;
+  timestamp?: number;
+  condition?: Record<string, any>;
+  depth?: number;
 }
 
-interface CausalGraph {
-  events: Map<string, CausalEvent>;
-  adjacency: Map<string, string[]>;
+interface FleetNode {
+  id: string;
+  lastSeen: number;
+  eventCount: number;
+  version: string;
 }
 
 class CausalMemory {
-  private graph: CausalGraph;
-  private storage: KVNamespace;
+  private events: Map<string, CausalEvent>;
+  private fleet: Map<string, FleetNode>;
+  private graph: Map<string, Set<string>>;
 
-  constructor(storage: KVNamespace) {
-    this.graph = {
-      events: new Map(),
-      adjacency: new Map()
-    };
-    this.storage = storage;
+  constructor() {
+    this.events = new Map();
+    this.fleet = new Map();
+    this.graph = new Map();
   }
 
-  async initialize() {
-    try {
-      const stored = await this.storage.get('causal_graph', 'json');
-      if (stored && stored.events) {
-        this.graph.events = new Map(Object.entries(stored.events));
-        this.graph.adjacency = new Map(Object.entries(stored.adjacency));
-      }
-    } catch (e) {
-      console.log('No existing graph found, starting fresh');
-    }
-  }
-
-  async addEvent(event: CausalEvent): Promise<void> {
-    this.graph.events.set(event.id, event);
+  addEvent(event: CausalEvent): void {
+    this.events.set(event.id, event);
     
     if (event.causeId) {
-      const existing = this.graph.adjacency.get(event.causeId) || [];
-      existing.push(event.id);
-      this.graph.adjacency.set(event.causeId, existing);
+      if (!this.graph.has(event.causeId)) {
+        this.graph.set(event.causeId, new Set());
+      }
+      this.graph.get(event.causeId)!.add(event.id);
     }
     
-    await this.persist();
+    event.effectIds.forEach(effectId => {
+      if (!this.graph.has(event.id)) {
+        this.graph.set(event.id, new Set());
+      }
+      this.graph.get(event.id)!.add(effectId);
+    });
   }
 
-  async getEffects(causeId: string, depth: number = 3): Promise<CausalEvent[]> {
+  getEffects(causeId: string, depth: number = 1): CausalEvent[] {
     const results: CausalEvent[] = [];
     const visited = new Set<string>();
-    
-    const traverse = (currentId: string, currentDepth: number) => {
-      if (currentDepth >= depth || visited.has(currentId)) return;
+    const queue: {id: string, level: number}[] = [{id: causeId, level: 0}];
+
+    while (queue.length > 0) {
+      const current = queue.shift()!;
       
-      visited.add(currentId);
-      const children = this.graph.adjacency.get(currentId) || [];
-      
-      for (const childId of children) {
-        const child = this.graph.events.get(childId);
-        if (child) {
-          results.push(child);
-          traverse(childId, currentDepth + 1);
-        }
+      if (visited.has(current.id) || current.level > depth) continue;
+      visited.add(current.id);
+
+      const event = this.events.get(current.id);
+      if (event && current.level > 0) {
+        results.push(event);
       }
-    };
-    
-    traverse(causeId, 0);
+
+      const effects = this.graph.get(current.id);
+      if (effects) {
+        effects.forEach(effectId => {
+          queue.push({id: effectId, level: current.level + 1});
+        });
+      }
+    }
+
     return results;
   }
 
-  async queryCausalChain(startId: string, endId?: string): Promise<CausalEvent[]> {
-    const path: CausalEvent[] = [];
-    const findPath = (currentId: string, targetId?: string): boolean => {
-      const current = this.graph.events.get(currentId);
-      if (!current) return false;
-      
-      path.push(current);
-      
-      if (targetId && currentId === targetId) return true;
-      if (!targetId && !this.graph.adjacency.has(currentId)) return true;
-      
-      const children = this.graph.adjacency.get(currentId) || [];
-      for (const childId of children) {
-        if (findPath(childId, targetId)) return true;
-      }
-      
-      path.pop();
-      return false;
-    };
-    
-    findPath(startId, endId);
-    return path;
-  }
+  queryCounterfactual(eventId: string, condition: Record<string, any>): CausalEvent[] {
+    const event = this.events.get(eventId);
+    if (!event) return [];
 
-  async simulateIntervention(eventId: string, alternativeAction: string): Promise<CausalEvent[]> {
-    const original = this.graph.events.get(eventId);
-    if (!original) return [];
-    
-    const simulated: CausalEvent[] = [];
-    const affectedEvents = await this.getEffects(eventId, 5);
-    
-    affectedEvents.forEach(event => {
-      simulated.push({
-        ...event,
-        effect: `[SIMULATED] ${event.effect}`,
-        metadata: {
-          ...event.metadata,
-          simulatedFrom: eventId,
-          originalAction: original.action,
-          alternativeAction
-        }
-      });
+    return Array.from(this.events.values()).filter(e => {
+      return e.timestamp < event.timestamp && 
+             Object.keys(condition).every(key => 
+               (e as any)[key] === condition[key]
+             );
     });
-    
-    return simulated;
   }
 
-  async temporalQuery(startTime: number, endTime: number): Promise<CausalEvent[]> {
-    const results: CausalEvent[] = [];
-    
-    for (const event of this.graph.events.values()) {
-      if (event.timestamp >= startTime && event.timestamp <= endTime) {
-        results.push(event);
-      }
+  getTemporalEvents(start: number, end: number): CausalEvent[] {
+    return Array.from(this.events.values())
+      .filter(e => e.timestamp >= start && e.timestamp <= end)
+      .sort((a, b) => a.timestamp - b.timestamp);
+  }
+
+  getCausalChain(eventId: string, maxDepth: number = 10): CausalEvent[] {
+    const chain: CausalEvent[] = [];
+    let currentId: string | undefined = eventId;
+    let depth = 0;
+
+    while (currentId && depth < maxDepth) {
+      const event = this.events.get(currentId);
+      if (!event) break;
+      
+      chain.push(event);
+      currentId = event.causeId;
+      depth++;
     }
-    
-    return results.sort((a, b) => a.timestamp - b.timestamp);
+
+    return chain.reverse();
   }
 
-  private async persist(): Promise<void> {
-    const serialized = {
-      events: Object.fromEntries(this.graph.events),
-      adjacency: Object.fromEntries(this.graph.adjacency)
-    };
-    
-    await this.storage.put('causal_graph', JSON.stringify(serialized));
+  updateFleet(nodeId: string, version: string): void {
+    this.fleet.set(nodeId, {
+      id: nodeId,
+      lastSeen: Date.now(),
+      eventCount: this.events.size,
+      version
+    });
+  }
+
+  getFleetStatus(): FleetNode[] {
+    const now = Date.now();
+    return Array.from(this.fleet.values())
+      .filter(node => now - node.lastSeen < 300000)
+      .sort((a, b) => a.lastSeen - b.lastSeen);
   }
 }
+
+const causalMemory = new CausalMemory();
 
 const htmlResponse = (content: string): Response => {
   const html = `
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Causal Memory</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Inter', sans-serif;
-            background: #0a0a0f;
-            color: #e5e5e5;
-            line-height: 1.6;
-            min-height: 100vh;
-            padding: 20px;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-        header {
-            border-bottom: 1px solid #1a1a2e;
-            padding-bottom: 20px;
-            margin-bottom: 40px;
-        }
-        h1 {
-            color: #ffffff;
-            font-size: 2.5rem;
-            font-weight: 700;
-            margin-bottom: 10px;
-        }
-        .accent { color: #dc2626; }
-        .subtitle {
-            color: #94a3b8;
-            font-size: 1.1rem;
-            font-weight: 400;
-        }
-        .endpoints {
-            background: #111827;
-            border-radius: 8px;
-            padding: 25px;
-            margin-bottom: 40px;
-            border-left: 4px solid #dc2626;
-        }
-        .endpoint {
-            margin-bottom: 15px;
-            padding: 12px;
-            background: #1e293b;
-            border-radius: 6px;
-            font-family: 'Monaco', 'Consolas', monospace;
-        }
-        .method {
-            display: inline-block;
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-weight: 600;
-            font-size: 0.85rem;
-            margin-right: 10px;
-        }
-        .post { background: #059669; color: white; }
-        .get { background: #2563eb; color: white; }
-        .footer {
-            margin-top: 60px;
-            padding-top: 20px;
-            border-top: 1px solid #1a1a2e;
-            text-align: center;
-            color: #64748b;
-            font-size: 0.9rem;
-        }
-        .fleet-badge {
-            display: inline-block;
-            background: #1e293b;
-            padding: 8px 16px;
-            border-radius: 20px;
-            margin-top: 10px;
-            color: #dc2626;
-            font-weight: 600;
-        }
-        code {
-            background: #1e293b;
-            padding: 2px 6px;
-            border-radius: 4px;
-            font-family: 'Monaco', 'Consolas', monospace;
-            font-size: 0.9em;
-        }
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Causal Memory</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { 
+      font-family: 'Inter', sans-serif; 
+      background: #0a0a0f; 
+      color: #e5e5e5; 
+      line-height: 1.6;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    .container { 
+      max-width: 1200px; 
+      margin: 0 auto; 
+      padding: 2rem; 
+      flex: 1;
+    }
+    header { 
+      border-bottom: 1px solid #1f1f2e; 
+      padding-bottom: 1.5rem;
+      margin-bottom: 2rem;
+    }
+    h1 { 
+      color: #dc2626; 
+      font-size: 2.5rem; 
+      font-weight: 700;
+      margin-bottom: 0.5rem;
+    }
+    .subtitle { 
+      color: #94a3b8; 
+      font-size: 1.1rem;
+      font-weight: 400;
+    }
+    .grid { 
+      display: grid; 
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); 
+      gap: 1.5rem; 
+      margin-bottom: 3rem;
+    }
+    .card { 
+      background: #11111a; 
+      border: 1px solid #1f1f2e; 
+      border-radius: 8px; 
+      padding: 1.5rem;
+      transition: transform 0.2s, border-color 0.2s;
+    }
+    .card:hover {
+      transform: translateY(-2px);
+      border-color: #dc2626;
+    }
+    .card h3 { 
+      color: #dc2626; 
+      margin-bottom: 1rem; 
+      font-weight: 600;
+    }
+    .endpoint { 
+      background: #1a1a2e; 
+      padding: 0.75rem; 
+      border-radius: 4px; 
+      margin: 0.5rem 0; 
+      font-family: monospace;
+      border-left: 3px solid #dc2626;
+    }
+    .stats { 
+      display: flex; 
+      gap: 2rem; 
+      margin-top: 1rem;
+    }
+    .stat { 
+      text-align: center;
+    }
+    .stat-value { 
+      font-size: 1.5rem; 
+      font-weight: 700; 
+      color: #dc2626;
+    }
+    .stat-label { 
+      font-size: 0.875rem; 
+      color: #94a3b8;
+    }
+    footer { 
+      background: #11111a; 
+      border-top: 1px solid #1f1f2e; 
+      padding: 2rem;
+      margin-top: auto;
+    }
+    .fleet-footer {
+      max-width: 1200px;
+      margin: 0 auto;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 1rem;
+    }
+    .fleet-nodes {
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+    }
+    .node-indicator {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #10b981;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+    .version { 
+      color: #94a3b8; 
+      font-size: 0.875rem;
+    }
+    .api-link {
+      color: #60a5fa;
+      text-decoration: none;
+      transition: color 0.2s;
+    }
+    .api-link:hover {
+      color: #dc2626;
+      text-decoration: underline;
+    }
+  </style>
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1>Causal <span class="accent">Memory</span></h1>
-            <p class="subtitle">Track and query cause-effect chains across fleet actions</p>
-        </header>
-        
-        <div class="endpoints">
-            <h2 style="color: #ffffff; margin-bottom: 20px;">API Endpoints</h2>
-            
-            <div class="endpoint">
-                <span class="method post">POST</span>
-                <code>/api/cause</code>
-                <p style="margin-top: 8px; color: #cbd5e1;">Record a causal event with action and effect</p>
-            </div>
-            
-            <div class="endpoint">
-                <span class="method get">GET</span>
-                <code>/api/effects?causeId=:id&depth=:depth</code>
-                <p style="margin-top: 8px; color: #cbd5e1;">Retrieve effects chain from a cause</p>
-            </div>
-            
-            <div class="endpoint">
-                <span class="method post">POST</span>
-                <code>/api/query</code>
-                <p style="margin-top: 8px; color: #cbd5e1;">Execute causal queries and simulations</p>
-            </div>
-            
-            <div class="endpoint">
-                <span class="method get">GET</span>
-                <code>/health</code>
-                <p style="margin-top: 8px; color: #cbd5e1;">Health check endpoint</p>
-            </div>
+  <div class="container">
+    <header>
+      <h1>Causal Memory</h1>
+      <p class="subtitle">Distributed causal reasoning engine with temporal analysis and counterfactual queries</p>
+      <div class="stats">
+        <div class="stat">
+          <div class="stat-value" id="eventCount">0</div>
+          <div class="stat-label">Causal Events</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value" id="fleetCount">0</div>
+          <div class="stat-label">Active Nodes</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value" id="graphSize">0</div>
+          <div class="stat-label">Graph Edges</div>
+        </div>
+      </div>
+    </header>
+    
+    <main>
+      <div class="grid">
+        <div class="card">
+          <h3>Record Cause</h3>
+          <p>Register new causal events with temporal metadata</p>
+          <div class="endpoint">POST /api/cause</div>
+          <pre><code>{
+  "id": "event_123",
+  "causeId": "event_122",
+  "description": "Service latency spike",
+  "tags": ["latency", "service-a"]
+}</code></pre>
         </div>
         
-        <div class="footer">
-            <p>Causal Reasoning Engine v1.0</p>
-            <p>Track and query cause-effect chains across fleet actions</p>
-            <div class="fleet-badge">Fleet Causal Intelligence</div>
+        <div class="card">
+          <h3>Query Effects</h3>
+          <p>Retrieve downstream effects from any cause</p>
+          <div class="endpoint">GET /api/effects?causeId=...</div>
+          <div class="endpoint">GET /api/effects?causeId=...&depth=3</div>
+          <p>Depth parameter controls causal chain length</p>
         </div>
+        
+        <div class="card">
+          <h3>Advanced Queries</h3>
+          <p>Counterfactual and temporal reasoning</p>
+          <div class="endpoint">POST /api/query</div>
+          <pre><code>{
+  "type": "counterfactual",
+  "eventId": "event_123",
+  "condition": {"tags": ["latency"]}
+}</code></pre>
+        </div>
+      </div>
+      
+      <div class="card">
+        <h3>API Documentation</h3>
+        <p>Full API reference available at <a href="/api/docs" class="api-link">/api/docs</a></p>
+        <p>Health check: <a href="/health" class="api-link">/health</a></p>
+        <p>Fleet status: <a href="/api/fleet" class="api-link">/api/fleet</a></p>
+      </div>
+    </main>
+  </div>
+  
+  <footer>
+    <div class="fleet-footer">
+      <div class="fleet-nodes">
+        <div class="node-indicator"></div>
+        <span>Causal Memory Fleet</span>
+      </div>
+      <div class="version">v1.0.0 | Causal Reasoning Engine</div>
+      <div id="liveStats" class="version">Initializing...</div>
     </div>
+  </footer>
+  
+  <script>
+    async function updateStats() {
+      try {
+        const [eventsRes, fleetRes] = await Promise.all([
+          fetch('/api/effects?causeId=root'),
+          fetch('/api/fleet')
+        ]);
+        
+        if (eventsRes.ok) {
+          const events = await eventsRes.json();
+          document.getElementById('eventCount').textContent = events.length || 0;
+          document.getElementById('graphSize').textContent = 
+            events.reduce((acc, e) => acc + (e.effectIds?.length || 0), 0);
+        }
+        
+        if (fleetRes.ok) {
+          const fleet = await fleetRes.json();
+          document.getElementById('fleetCount').textContent = fleet.length || 0;
+          document.getElementById('liveStats').textContent = 
+            \`\${fleet.length} nodes | \${new Date().toLocaleTimeString()}\`;
+        }
+      } catch (e) {
+        console.error('Stats update failed:', e);
+      }
+    }
+    
+    updateStats();
+    setInterval(updateStats, 10000);
+  </script>
 </body>
-</html>
-  `;
+</html>`;
   
   return new Response(html, {
     headers: {
       'Content-Type': 'text/html;charset=UTF-8',
-      'X-Frame-Options': 'DENY',
-      'Content-Security-Policy': "default-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'none';"
+      'Content-Security-Policy': "default-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; font-src https://fonts.gstatic.com;",
+      'X-Frame-Options': 'DENY'
     }
   });
 };
 
-const handleApiRequest = async (
-  request: Request,
-  causalMemory: CausalMemory,
-  pathname: string,
-  searchParams: URLSearchParams
-): Promise<Response> => {
-  const headers = {
-    'Content-Type': 'application/json',
-    'X-Frame-Options': 'DENY',
-    'Content-Security-Policy': "default-src 'self'"
-  };
+const handleRequest = async (request: Request): Promise<Response> => {
+  const url = new URL(request.url);
+  const path = url.pathname;
 
-  try {
-    if (request.method === 'POST' && pathname === '/api/cause') {
-      const event: CausalEvent = await request.json();
-      
-      if (!event.id || !event.action || !event.effect || !event.agent) {
-        return new Response(JSON.stringify({ error: 'Missing required fields' }), {
-          status: 400,
-          headers
-        });
-      }
-      
-      event.timestamp = event.timestamp || Date.now();
-      event.confidence = event.confidence || 1.0;
-      
-      await causalMemory.addEvent(event);
-      
-      return new Response(JSON.stringify({
-        success: true,
-        eventId: event.id,
-        message: 'Causal event recorded'
-      }), { headers });
-    }
+  if (path === '/' || path === '/dashboard') {
+    return htmlResponse('');
+  }
 
-    if (request.method === 'GET' && pathname === '/api/effects') {
-      const causeId = searchParams.get('causeId');
-      const depth = parseInt(searchParams.get('depth') || '3');
-      
-      if (!causeId) {
-        return new Response(JSON.stringify({ error: 'Missing causeId parameter' }), {
-          status: 400,
-          headers
-        });
-      }
-      
-      const effects = await causalMemory.getEffects(causeId, depth);
-      
-      return new Response(JSON.stringify({
-        causeId,
-        depth,
-        effects,
-        count: effects.length
-      }), { headers });
-    }
-
-    if (request.method === 'POST' && pathname === '/api/query') {
-      const query: CausalQuery = await request.json();
-      
-      let results: any[] = [];
-      
-      switch (query.type) {
-        case 'effects':
-          if (query.targetId) {
-            results = await causalMemory.getEffects(query.targetId, 3);
-          }
-          break;
-          
-        case 'causes':
-          if (query.startTime && query.endTime) {
-            results = await causalMemory.temporalQuery(query.startTime, query.endTime);
-          }
-          break;
-          
-        case 'chain':
-          if (query.targetId) {
-            results = await causalMemory.queryCausalChain(query.targetId);
-          }
-          break;
-          
-        case 'counterfactual':
-          if (query.intervention) {
-            results = await causalMemory.simulateIntervention(
-              query.intervention.eventId,
-              query.intervention.alternativeAction
-            );
-          }
-          break;
-      }
-      
-      return new Response(JSON.stringify({
-        queryType: query.type,
-        results,
-        count: results.length
-      }), { headers });
-    }
-
-    if (request.method === 'GET' && pathname === '/health') {
-      return new Response(JSON.stringify({
-        status: 'healthy',
-        timestamp: Date.now(),
-        service: 'causal-memory'
-      }), { headers });
-    }
-
-    return new Response(JSON.stringify({ error: 'Not found' }), {
-      status: 404,
-      headers
-    });
-
-  } catch (error) {
-    console.error('API error:', error);
-    return new Response(JSON.stringify({ 
-      error: 'Internal server error',
-      message: error instanceof Error ? error.message : 'Unknown error'
-    }), {
-      status: 500,
-      headers
+  if (path === '/health') {
+    return new Response(JSON.stringify({ status: 'ok', timestamp: Date.now() }), {
+      headers: { 'Content-Type': 'application/json' }
     });
   }
+
+  if (path === '/api/fleet') {
+    const fleet = causalMemory.getFleetStatus();
+    return new Response(JSON.stringify(fleet), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  if (path === '/api/cause' && request.method === 'POST') {
+    try {
+      const event: CausalEvent = await request.json();
+      event.timestamp = event.timestamp || Date.now();
+      event.confidence = event.confidence || 1.0;
+      event.effectIds = event.effectIds || [];
+      event.tags = event.tags || [];
+      
+      causalMemory.addEvent(event);
+      
+      const nodeId = request.headers.get('X-Node-ID') || 'unknown';
+      const version = request.headers.get('X-Node-Version') || '1.0.0';
+      causalMemory.updateFleet(nodeId, version);
+      
+      return new Response(JSON.stringify({ 
+        success: true, 
+        id: event.id,
+        timestamp: event.timestamp 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    } catch (error) {
+      return new Response(JSON.stringify({ error: 'Invalid event data' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  }
+
+  if (path === '/api/effects' && request.method === 'GET') {
+    const causeId = url.searchParams.get('causeId') || 'root';
+    const depth = parseInt(url.searchParams.get('depth') || '1');
+    
+    const effects = causalMemory.getEffects(causeId, depth);
+    return new Response(JSON.stringify(effects), {
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  if (path === '/api/query' && request.method === 'POST') {
+    try {
+      const query: CausalQuery = await request.json();
+      let results: CausalEvent[] = [];
+      
+      switch (query.type) {
+        case 'counterfactual':
+          if (query.eventId && query.condition) {
+            results = causalMemory.queryCounterfactual(query.eventId, query.condition);
+          }
+          break;
+        case 'temporal':
+          if (query.timestamp) {
+            const start = query.timestamp - 3600000;
+            const end = query.timestamp;
+            results = causalMemory.getTemporalEvents(start, end);
+          }
+          break;
+        case 'chain':
+          if (query.eventId) {
+            results = causalMemory.getCausalChain(query.eventId, query.depth);
+          }
+          break;
+      }
+      
+      return new Response(JSON.stringify(results), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    } catch (error) {
+      return new Response(JSON.stringify({ error: 'Invalid query' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  }
+
+  return new Response(JSON.stringify({ error: 'Not found' }), {
+    status: 404,
+    headers: { 'Content-Type': 'application/json' }
+  });
 };
 
 export default {
-  async fetch(request: Request, env: { CAUSAL_MEMORY: KVNamespace }, ctx: ExecutionContext): Promise<Response> {
-    const url = new URL(request.url);
-    const pathname = url.pathname;
-    const searchParams = url.searchParams;
+  async fetch(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
+    const response = await handleRequest(request);
     
-    const causalMemory = new CausalMemory(env.CAUSAL_MEMORY);
-    await causalMemory.initialize();
+    const headers = new Headers(response.headers);
+    headers.set('X-Frame-Options', 'DENY');
+    headers.set('Content-Security-Policy', 
+      "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self'");
     
-    if (pathname === '/' || pathname === '') {
-      return htmlResponse('');
-    }
-    
-    if (pathname.startsWith('/api/') || pathname === '/health') {
-      return handleApiRequest(request, causalMemory, pathname, searchParams);
-    }
-    
-    return new Response('Not found', { status: 404 });
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers
+    });
   }
 };
